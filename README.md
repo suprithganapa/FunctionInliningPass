@@ -8,8 +8,8 @@
 | Name | USN |
 |------|-----|
 | Suprith GB | 1RV23CS255 |
-| Sushanth Joshi | — |
-| Tallam Sri Sai Subramanyam | — |
+| Sushanth Joshi | 1RV23CS260 |
+| Tallam Sri Sai Subramanyam | 1RV23CS265 |
 
 An LLVM New Pass Manager plugin that implements a **custom module-level function inlining optimization** with cost-based heuristics, recursion detection, and dead function elimination.
 
