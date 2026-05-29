@@ -1,5 +1,16 @@
 # FunctionInliningPass — LLVM Custom Optimization Pass
 
+
+> **Compiler Design Lab — Experiential Learning (EL)**  
+> Department of Computer Science & Engineering, R V College of Engineering, Bengaluru
+
+## Team
+| Name | USN |
+|------|-----|
+| Suprith GB | 1RV23CS255 |
+| Sushanth Joshi | — |
+| Tallam Sri Sai Subramanyam | — |
+
 An LLVM New Pass Manager plugin that implements a **custom module-level function inlining optimization** with cost-based heuristics, recursion detection, and dead function elimination.
 
 **Pipeline name:** `simple-inline-pass`  
