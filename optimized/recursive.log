@@ -1,0 +1,13 @@
+[simple-inline-pass] Skipping recursive function: fact
+[simple-inline-pass] Function: fact | Cost: 22 | SKIP
+[simple-inline-pass] Skipping recursive function: fact
+[simple-inline-pass] Function: fact | Cost: 22 | SKIP
+[simple-inline-pass] ===== Pass Summary =====
+[simple-inline-pass] Calls inspected: 2
+[simple-inline-pass] Calls inlined: 0
+[simple-inline-pass] Recursive blocks: 2
+[simple-inline-pass] External/declaration skips: 0
+[simple-inline-pass] Main skips: 0
+[simple-inline-pass] Cost-based skips: 0
+[simple-inline-pass] Dead functions removed: 0
+[simple-inline-pass] Functions cleaned for unreachable blocks: 0
