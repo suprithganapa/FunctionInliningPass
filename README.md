@@ -115,17 +115,6 @@ diff ir/small.ll optimized/small.optimized.ll  # IR diff
 
 ---
 
-## Configurable Threshold
-
-```bash
-bash scripts/run.sh 15    # inline functions with cost < 15
-bash scripts/run.sh 5     # stricter — inline only very small functions
-```
-
-Default threshold: `10`
-
----
-
 ## Example Output
 
 For `tests/small.c` (a simple `add` function):
