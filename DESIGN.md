@@ -1,107 +1,154 @@
-# DESIGN.md — FunctionInliningPass
+# DESIGN — InlinePass Approach and Alternatives
 
 ## Problem Statement
 
-Function calls in compiled code introduce overhead: pushing arguments, saving registers, jumping to the callee, and returning. For small, frequently-called functions, this overhead can outweigh the actual work done. **Function inlining** eliminates the call by inserting the callee's body directly at the call site, enabling further optimizations like constant folding and register allocation across what were previously function boundaries.
+Function inlining is one of the highest-leverage compiler optimisations:
+eliminating call overhead, enabling downstream constant propagation, and
+shrinking the call graph for later passes. LLVM ships a production inliner
+(`-inline` / `InlinerPass`), but it is deeply entangled with the legacy pass
+manager, profile data infrastructure, and attribute propagation machinery.
 
-The goal of this pass is to implement a **custom, cost-aware inlining pass** for LLVM IR that is transparent, configurable, and safe — avoiding correctness issues like infinite inlining of recursive functions.
+This project implements a **standalone, teachable inliner** as an out-of-tree
+LLVM module pass. The goals are:
+
+- Demonstrate end-to-end LLVM pass infrastructure usage (new pass manager,
+  `PassPlugin`, `ModuleAnalysisManager`).
+- Show how a simple cost model plus a call graph can make inlining decisions
+  that are measurably better than a naïve "always inline small functions"
+  policy.
+- Be easy to read, build, and extend.
 
 ---
 
-## Design Goals
+## High-Level Approach
 
-| Goal | Decision |
-|------|----------|
-| Correctness | Never inline recursive functions; check inlining success |
-| Performance | Inline only small functions (cost < threshold) |
-| Transparency | Log every decision to `stderr` with cost + reason |
-| Configurability | Threshold exposed as a command-line option |
-| Cleanliness | Remove dead functions and unreachable blocks after inlining |
+```
+Module
+  └─► CallGraphAnalysis          (LLVM built-in)
+        └─► collectCallSites()   (iterate CG edges → CallBase*)
+              └─► for each CallBase:
+                    shouldInline() → CostModel + guards
+                      ├─ INLINE → InlineFunction() + track caller
+                      └─ SKIP   → log reason
+              └─► cleanupUnreachableBlocks()   (post-inline hygiene)
+              └─► removeDeadFunctions()        (iterative DCE sweep)
+```
 
----
+### Why a Module Pass?
 
-## Approach
-
-### Module-Level Pass
-
-The pass operates at **module level** (not function level) because inlining decisions require seeing both the caller and callee at the same time, and dead function elimination requires iterating over all functions in the module.
-
-### Two-Phase Design
-
-**Phase 1 — Collect then Inline:**  
-All call sites are collected into a `SmallVector` *before* any inlining begins. This is critical — iterating over instructions while modifying them causes iterator invalidation. Pre-collecting the call sites avoids undefined behavior.
-
-**Phase 2 — Cleanup:**  
-After inlining, the pass runs two cleanup steps:
-1. `removeUnreachableBlocks()` on all callers that were modified (inlining can leave unreachable code paths)
-2. Dead function elimination — iterates until no more dead functions are found (fixpoint loop), since removing one function can expose another as dead
+Inlining is inherently a *cross-function* transform — the callee's body is
+moved into the caller. LLVM's `FunctionPass` cannot add or remove functions
+from the module, and cannot examine the full call graph. A `ModulePass` (new
+PM: `PassInfoMixin<T>` on `Module`) can do both.
 
 ---
 
 ## Cost Model
 
-The cost model assigns weights to each instruction in the callee:
+The cost model assigns an integer score to each candidate callee:
 
-| Instruction Type | Weight |
-|------------------|--------|
-| Binary operators (add, mul, etc.) | 1 |
-| Calls | 3 |
-| Branches / switches | 2 |
-| Everything else (load, store, return, etc.) | 1 |
-| Back-edge bonus (likely loop) | +5 |
+| Component | Formula | Rationale |
+|-----------|---------|-----------|
+| Instruction weight | Σ `instructionWeight(I)` over all BBs | Approximates code-size growth after inlining |
+| Back-edge penalty | +5 if any BB has a back-edge successor | Loops make inline expansion expensive |
+| Call-frequency discount | `-(numReferences × 2)` | A function called many times amortises fixed costs |
 
-A back-edge is detected by checking if any basic block has a successor that was already visited in IR order — a lightweight heuristic for loop detection.
+**`instructionWeight` table:**
 
-**Threshold:** Functions with `cost >= threshold` are NOT inlined. Default is `10`, configurable with `-simple-inline-threshold=N`.
+| Instruction class | Weight |
+|-------------------|--------|
+| `BinaryOperator`  | 1 |
+| `CallBase`        | 3 |
+| `BranchInst` / `SwitchInst` | 2 |
+| Everything else   | 1 |
+
+The score is compared against `InlineThreshold` (default **20**). Scores
+below the threshold are eligible for inlining.
+
+### Why Not Use LLVM's `InlineCost` API?
+
+LLVM's built-in cost model (`llvm/Analysis/InlineCost.h`) is accurate but
+complex: it simulates simplifications, accounts for attribute-based bonuses,
+and requires a `TargetTransformInfo` query. Using it here would obscure the
+core mechanics. The hand-rolled model is intentionally simple and auditable.
 
 ---
 
-## Inlining Rules
+## Inlining Guards
 
-A call site is inlined only if ALL of the following hold:
+| Guard | Condition | Why |
+|-------|-----------|-----|
+| External declaration | `Callee->isDeclaration()` | No IR body to inline |
+| Direct recursion | CG self-edge on callee | Would produce infinite expansion |
+| `main` function | `getName() == "main"` | Inlining `main` makes no semantic sense |
+| Cost threshold | `Cost >= InlineThreshold` | Prevents code-size explosion |
 
-1. The callee is a defined function (not just a declaration/external)
-2. The callee is not named `main`
-3. The callee is not directly recursive (calls itself)
-4. The computed cost is strictly below the threshold
+**Indirect recursion** (mutual recursion): Not explicitly detected as a cycle
+in the current implementation. Because both functions in a mutual-recursion
+pair will typically exceed the cost threshold, they are blocked by the size
+guard in practice. See *Future Work* below.
+
+---
+
+## Dead-Code Elimination (DCE)
+
+After inlining, callees that have been fully absorbed may have no remaining
+callers. A two-phase cleanup runs:
+
+1. **`cleanupUnreachableBlocks`** — After each inlined call site, the caller
+   may contain unreachable BBs (e.g., the now-dead call instruction's
+   continuation). `removeUnreachableBlocks()` (LLVM utility) handles this.
+
+2. **`removeDeadFunctions`** — Iteratively erases any non-`main`,
+   non-address-taken function whose `use_empty()` is true. Iterates until
+   convergence to handle chains (if A was the only caller of B, removing A
+   may make B dead too).
 
 ---
 
 ## Alternatives Considered
 
-### Alternative 1: Always-Inline (No Cost Model)
-Inline every non-recursive function regardless of size.
+### 1. Always-inline on `noinline` attribute removal
 
-**Rejected because:** Large functions inlined into many callers bloat code size (code-size explosion). It can also hurt instruction cache performance by generating huge caller functions.
+Remove `noinline` from small functions and let LLVM's stock inliner run.
 
-### Alternative 2: Call Count Heuristic
-Inline a function only if it is called more than N times (favoring hot functions).
+**Rejected**: This delegates all decision-making to LLVM's pass and defeats
+the educational goal of building an explicit cost model.
 
-**Rejected because:** Requires profiling data or a use-count analysis pass. Adds complexity without a clear win for this project's scope.
+### 2. Function-level pass with module-level state via global variables
 
-### Alternative 3: Function-Level Pass with Inline Hints
-Use a `FunctionPass` and mark eligible callees with `alwaysinline` attribute.
+Collect functions in a `FunctionPass` and post-process in a second pass.
 
-**Rejected because:** A function-level pass cannot see the whole module at once, making dead function elimination impossible. Module-level is strictly more powerful.
+**Rejected**: The LLVM new pass manager makes two-pass coordination
+cumbersome, and function-level visibility is insufficient for call-graph
+queries.
 
-### Alternative 4: Use LLVM's Built-in Inliner (`-inline` pass)
-Just use LLVM's existing inlining pass.
+### 3. Inline everything under a flat instruction-count cap
 
-**Rejected because:** The goal of this project is to implement and understand the inlining mechanism at the LLVM API level — using the built-in pass provides no learning value and no custom control.
+Count instructions only, no call-frequency discount.
+
+**Rejected**: A function called from 10 sites with a cost of 18 would
+otherwise be skipped, even though it clearly amortises well. The
+`numReferences`-based discount handles this cleanly (see test03).
+
+### 4. Use `InlineAdvisor` / ML-guided inlining
+
+LLVM 12+ supports an ML-based inlining advisor.
+
+**Rejected for this project**: requires TensorFlow/ONNX infrastructure and
+obscures the algorithmic choices. Noted as a future extension.
 
 ---
 
-## Known Limitations
+## Future Work
 
-- **Indirect recursion:** If `f` calls `g` and `g` calls `f`, neither is flagged as recursive by the current guard. This could cause infinite inlining in theory, but is avoided in practice because after inlining `f` into `g`, the call to `f` would be from `main` or another function, not `g` itself.
-- **No inlining of callees with `byval` parameters or varargs:** These are more complex cases not handled here.
-- **Single-pass:** The pass runs once. A production inliner would iterate to a fixpoint.
-
----
-
-## Future Extensions
-
-- Indirect recursion detection via call graph SCC analysis
-- Hot-path weighting using `BranchProbabilityInfo`
-- Iterative inlining until fixpoint
-- Integration with `InlineCost` LLVM API for a more accurate model
+- **Indirect recursion cycle detection**: Walk the CG with DFS to detect SCCs
+  (Strongly Connected Components) and block inlining within any SCC with ≥2
+  nodes.
+- **Inlining order**: Currently processes call sites in arbitrary CG traversal
+  order. A bottom-up post-order traversal (leaves first) would expose more
+  inlining opportunities in the same pass.
+- **Attribute propagation**: After inlining, propagate `readnone`/`readonly`
+  and `nounwind` attributes from callee to caller where safe.
+- **Profile-guided threshold**: Read block-frequency data (`BlockFrequencyInfo`)
+  to weight hot paths more aggressively.

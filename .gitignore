@@ -1,22 +1,4 @@
-# Build artifacts
 build/
-*.so
-*.o
-*.a
-
-# CMake cache and generated files
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
-install_manifest.txt
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS files
-.DS_Store
-Thumbs.db
+results/
+*.ll
+*.log

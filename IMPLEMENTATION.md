@@ -1,155 +1,194 @@
-# IMPLEMENTATION.md — FunctionInliningPass
+# IMPLEMENTATION — LLVM Details
 
-## LLVM Pass Framework Used
+## Source File
 
-This pass uses the **New Pass Manager (NPM)** introduced in LLVM 14+. It does NOT use the legacy `FunctionPass` / `ModulePass` API.
-
-### Key framework classes:
-
-| Class | Role |
-|-------|------|
-| `PassInfoMixin<SimpleInlinePass>` | Base class for NPM passes; provides boilerplate |
-| `ModuleAnalysisManager` | Passed to `run()`; used to query analyses (unused here) |
-| `PassPluginLibraryInfo` | Struct returned by `llvmGetPassPluginInfo()` to register the plugin |
-| `PassBuilder` | Used inside the registration callback to attach the pass to the pipeline |
+`src/InlinePass.cpp` — single translation unit, ~280 lines.
 
 ---
 
-## Plugin Registration
+## LLVM Infrastructure Used
+
+### Pass Registration (New Pass Manager)
 
 ```cpp
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "FunctionInliningPass", "0.1",
-    [](PassBuilder &PB) {
-      PB.registerPipelineParsingCallback(
-        [](StringRef Name, ModulePassManager &MPM,
-           ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "simple-inline-pass") {
-            MPM.addPass(SimpleInlinePass());
-            return true;
-          }
-          return false;
-        });
-    }};
+  return {LLVM_PLUGIN_API_VERSION, "InlinePass", "0.1",
+          [](PassBuilder &PB) {
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &MPM, ...) {
+                  if (Name == "inline-pass") {
+                    MPM.addPass(InlinePass());
+                    return true;
+                  }
+                  return false;
+                });
+          }};
 }
 ```
 
-- `LLVM_ATTRIBUTE_WEAK` ensures the symbol is weak-linked and discoverable at runtime.
-- `registerPipelineParsingCallback` hooks into `opt`'s `-passes=` argument parser so `simple-inline-pass` is recognized.
+- `LLVM_ATTRIBUTE_WEAK` is required so the DSO symbol resolves correctly
+  when `opt --load-pass-plugin` dlopen's the shared library.
+- `LLVM_PLUGIN_API_VERSION` ensures ABI compatibility between the plugin and
+  the host `opt` binary.
+- Registered as a **module** pass (`ModulePassManager`) because inlining
+  requires cross-function mutation.
 
----
-
-## Command-Line Option
-
-```cpp
-static cl::opt<unsigned> InlineThreshold(
-    "simple-inline-threshold",
-    cl::desc("Instruction cost threshold for simple-inline-pass"),
-    cl::init(10));
-```
-
-Uses `llvm/Support/CommandLine.h`. The option is global and read at pass runtime. Invoked as:
-```bash
-opt ... -simple-inline-threshold=15 ...
-```
-
----
-
-## Pass Entry Point
+### Pass Entry Point
 
 ```cpp
-PreservedAnalyses run(Module &M, ModuleAnalysisManager &)
+class InlinePass : public PassInfoMixin<InlinePass> {
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
+};
 ```
 
-The pass entry point. Returns:
-- `PreservedAnalyses::none()` — if IR was changed (forces re-analysis)
-- `PreservedAnalyses::all()` — if no changes were made
+`PassInfoMixin` provides the boilerplate (`name()`, `isRequired()`, etc.)
+so only `run` needs to be implemented.
 
----
+### CallGraph Analysis
 
-## LLVM APIs Used
-
-### 1. Call Site Collection
 ```cpp
-dyn_cast<CallBase>(&I)
+CallGraph &CG = MAM.getResult<CallGraphAnalysis>(M);
 ```
-`CallBase` is the common base class for `CallInst` and `InvokeInst`. Collecting all call bases before modification avoids iterator invalidation.
 
-### 2. Inlining
+`CallGraphAnalysis` is a built-in LLVM module analysis. Requesting it through
+`MAM` ensures it is computed lazily and cached. The returned `CallGraph`
+maps each `Function*` to a `CallGraphNode*`, which stores outgoing call edges
+as `(Optional<WeakTrackingVH>, CallGraphNode*)` pairs.
+
+**Edge iteration (LLVM 14 API):**
+
+```cpp
+for (auto &Edge : *Node) {
+    if (Edge.first) {                        // Optional has a value
+        if (Value *V = *Edge.first) {        // WeakTrackingVH still live
+            if (auto *CB = dyn_cast<CallBase>(V)) {
+                Out.push_back(CB);
+            }
+        }
+    }
+}
+```
+
+`WeakTrackingVH` is a weak value handle — it nullifies itself if the
+referenced `Value` is deleted. The double check (`Edge.first` then `*Edge.first`)
+is therefore necessary for correctness.
+
+> **LLVM 18+ note**: In LLVM 18 the `Optional<WeakTrackingVH>` was replaced
+> with `std::optional<WeakTrackingVH>`. The code compiles unchanged because
+> LLVM provides `llvm::Optional` as an alias, but you may see deprecation
+> warnings. Replace `Edge.first` checks with `Edge.first.has_value()` to
+> silence them.
+
+### Inlining
+
 ```cpp
 InlineFunctionInfo IFI;
 InlineResult Result = InlineFunction(*CB, IFI);
 ```
-- `InlineFunction()` from `llvm/Transforms/Utils/Cloning.h` performs the actual inlining
-- `InlineFunctionInfo` carries info about the inlining (e.g., inlined static allocas)
-- `InlineResult` reports success or failure (and the failure reason string)
 
-### 3. Recursion Detection
-```cpp
-dyn_cast<CallBase>(&I)->getCalledFunction() == &F
-```
-Checks if any call inside function `F` calls `F` itself.
+`InlineFunction` (from `llvm/Transforms/Utils/Cloning.h`) performs the
+actual splice:
 
-### 4. Unreachable Block Removal
-```cpp
-removeUnreachableBlocks(F)
-```
-From `llvm/Transforms/Utils/BasicBlockUtils.h`. Removes basic blocks that have no predecessors (unreachable after CFG changes from inlining).
+1. Clones the callee's basic blocks into the caller.
+2. Replaces the `call` instruction with the entry block of the clone.
+3. Wires the return value(s) back to the original call's users.
+4. Updates the `CallGraph` incrementally via `IFI`.
 
-### 5. Dead Function Elimination
+`InlineFunctionInfo` can be given a `CallGraph*` to keep CG edges
+consistent post-inline; we rely on it implicitly here (the `CallGraph` is
+already borrowed from `MAM`).
+
+### Unreachable Block Removal
+
 ```cpp
-F.use_empty()          // no remaining uses (callers)
-F.hasAddressTaken()    // skip if address is taken (could be called indirectly)
-F.eraseFromParent()    // remove from module
+#include "llvm/Transforms/Utils/Local.h"
+removeUnreachableBlocks(F);   // returns true if anything changed
 ```
 
-### 6. Back-edge Detection (Loop Heuristic)
+After inlining, the original call instruction is replaced in-place. The
+block containing the call (if it was the only instruction after a
+terminator) may become unreachable. This single utility call handles the
+cleanup via a reachability DFS from the entry block.
+
+### Dead Function Elimination
+
 ```cpp
-for (const BasicBlock *Succ : successors(&BB)) {
-    if (Seen.contains(Succ)) return true;
+for (Function &F : M) {
+    if (!F.isDeclaration() && F.getName() != "main"
+        && !F.hasAddressTaken() && F.use_empty()) {
+        ToErase.push_back(&F);
+    }
 }
+for (Function *F : ToErase) F->eraseFromParent();
 ```
-Uses `llvm/IR/CFG.h` for `successors()`. Checks if any block's successor was already seen in forward IR order — a conservative but cheap loop heuristic.
 
----
+`use_empty()` checks whether any IR `Value` still holds a reference to
+the function (direct calls, function pointers, metadata). Iterating to
+convergence handles cascading dead-code (removing A may make B dead).
+`hasAddressTaken()` guards against removing functions whose address is
+stored (e.g., callback tables).
 
-## Data Structures
+### Command-Line Option
 
-| Structure | Type | Purpose |
-|-----------|------|---------|
-| `CallSites` | `SmallVector<CallBase*, 64>` | Pre-collected call sites to avoid invalidation |
-| `TouchedFunctions` | `SmallVector<Function*, 16>` | Callers modified by inlining (for cleanup) |
-| `Seen` | `DenseSet<Function*>` | Deduplication in cleanup pass |
-| `InlineStats` | plain struct | Counters for the summary log |
+```cpp
+static cl::opt<unsigned> InlineThreshold(
+    "inline-threshold-cost",
+    cl::desc("Instruction cost threshold for inline-pass"),
+    cl::init(20));
+```
 
-`SmallVector` and `DenseSet` are LLVM's performance-optimized equivalents of `std::vector` and `std::unordered_set`, using inline storage to avoid heap allocation for small sizes.
+`cl::opt` integrates with LLVM's command-line parser. Users pass
+`--inline-threshold-cost=<N>` to `opt`; the value is read at pass
+execution time.
 
 ---
 
 ## Build System
 
-Uses `add_llvm_pass_plugin()` from LLVM's CMake module `AddLLVM`:
+`src/CMakeLists.txt`:
 
 ```cmake
 find_package(LLVM REQUIRED CONFIG)
-list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
-include(AddLLVM)
-
-add_llvm_pass_plugin(FunctionInliningPass src/InlinerPass.cpp)
+# ...
+add_library(InlinePass MODULE InlinePass.cpp)
+target_link_libraries(InlinePass PUBLIC LLVM)
 ```
 
-This macro sets the correct shared library flags, RPATH, and LLVM link dependencies automatically. Output: `libFunctionInliningPass.so`.
+Key points:
+- `MODULE` (not `SHARED`) produces a `dlopen`-able plugin, not a linkable
+  shared library. `opt --load-pass-plugin` expects a `MODULE`.
+- `-fno-rtti` is mandatory: LLVM headers disable RTTI, and mixing RTTI
+  and non-RTTI translation units causes linker errors with `dynamic_cast`.
+- `find_package(LLVM CONFIG)` sets `LLVM_INCLUDE_DIRS`, `LLVM_LIBRARY_DIRS`,
+  and `LLVM_DEFINITIONS` automatically from the installed LLVM cmake config.
 
 ---
 
-## How Inlining Works Internally
+## Data Structures
 
-When `InlineFunction(*CB, IFI)` is called:
+| Name | Type | Purpose |
+|------|------|---------|
+| `CallSites` | `SmallVector<CallBase*, 64>` | Collected call sites to evaluate |
+| `TouchedFunctions` | `SmallVector<Function*, 16>` | Callers modified by inlining (for unreachable-block cleanup) |
+| `InlineStats` | plain struct | Counters for the summary log |
+| `InlineDecision` | `{bool CanInline, int Cost}` | Return value of `shouldInline()` |
 
-1. LLVM clones all basic blocks of the callee
-2. Arguments of the callee are mapped to the actual parameters at the call site
-3. The cloned blocks are inserted into the caller's function body, just after the call instruction
-4. The return value (if any) replaces the call's result
-5. The original `call` instruction is removed
+`SmallVector` is chosen over `std::vector` because LLVM's allocator can
+service small-capacity vectors without a heap allocation (inline storage of
+64 / 16 elements respectively).
 
-The caller's CFG is updated to connect the new blocks. This may leave some blocks unreachable (e.g., if the callee had early returns), which is why `removeUnreachableBlocks()` is called afterward.
+---
+
+## Preserved Analyses
+
+```cpp
+return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+```
+
+- `none()` — the pass modified the IR; all cached analyses are invalidated.
+- `all()` — no-op run; downstream passes can reuse cached results.
+
+In a production pass you would invalidate only the analyses actually
+affected (e.g., `PA.abandon<CallGraphAnalysis>()`). For simplicity, and
+because inlining invalidates almost everything anyway, `none()` is correct.
